@@ -1,2 +1,5 @@
 img/developer-dark.svg:Zone.Identifier
 commit.txt
+
+logs/
+*.log
