@@ -22,38 +22,47 @@ export async function POST(request) {
       );
     }
 
-    // 2. Local fallback storage: append message to a local file
-    const dataDir = path.join(process.cwd(), 'data');
-    const filePath = path.join(dataDir, 'messages.json');
-    
-    // Ensure the data directory exists
-    await fs.mkdir(dataDir, { recursive: true });
-
-    let existingMessages = [];
+    // 2. Best-effort local storage: append the message to a local file.
+    //    This is non-fatal: on serverless/production hosts (Vercel, Netlify,
+    //    Lambda) the app filesystem is read-only, so the write throws EROFS.
+    //    We must NOT let that fail the request — email is the real delivery
+    //    path, so any storage error is logged and swallowed.
+    let stored = true;
     try {
-      const fileContent = await fs.readFile(filePath, 'utf-8');
-      existingMessages = JSON.parse(fileContent);
-    } catch (err) {
-      // File doesn't exist yet or is empty, start fresh
+      const dataDir = path.join(process.cwd(), 'data');
+      const filePath = path.join(dataDir, 'messages.json');
+
+      await fs.mkdir(dataDir, { recursive: true });
+
+      let existingMessages = [];
+      try {
+        const fileContent = await fs.readFile(filePath, 'utf-8');
+        existingMessages = JSON.parse(fileContent);
+      } catch (err) {
+        // File doesn't exist yet or is empty, start fresh
+      }
+
+      existingMessages.push({
+        id: Date.now().toString(),
+        name,
+        email,
+        phone,
+        subject,
+        message,
+        timestamp: new Date().toISOString()
+      });
+
+      await fs.writeFile(filePath, JSON.stringify(existingMessages, null, 2), 'utf-8');
+    } catch (storageErr) {
+      stored = false;
+      console.warn('Local message storage skipped (read-only filesystem?):', storageErr.message);
     }
 
-    const newMessage = {
-      id: Date.now().toString(),
-      name,
-      email,
-      phone,
-      subject,
-      message,
-      timestamp: new Date().toISOString()
-    };
-
-    existingMessages.push(newMessage);
-    await fs.writeFile(filePath, JSON.stringify(existingMessages, null, 2), 'utf-8');
-
-    // 3. Try to send an email if SMTP credentials are configured in environment variables
+    // 3. Send an email if SMTP credentials are configured in environment variables
     const emailUser = process.env.EMAIL_USER;
     const emailPass = process.env.EMAIL_PASS;
     const emailTo = process.env.EMAIL_TO || emailUser;
+    let emailed = false;
 
     if (emailUser && emailPass) {
       if (!nodemailer) {
@@ -88,11 +97,23 @@ export async function POST(request) {
       };
 
       await transporter.sendMail(mailOptions);
+      emailed = true;
+    }
+
+    // If the message was neither emailed nor stored, it is lost — surface a real
+    // error instead of falsely telling the visitor it was sent. This happens in
+    // production when SMTP env vars are missing AND the filesystem is read-only.
+    if (!emailed && !stored) {
+      console.error('Contact message not delivered: no SMTP config and storage unavailable.');
+      return NextResponse.json(
+        { error: 'The message service is not configured. Please email me directly.' },
+        { status: 503 }
+      );
     }
 
     return NextResponse.json({
       success: true,
-      message: 'Message received and stored successfully!'
+      message: 'Message received successfully!'
     });
 
   } catch (error) {
